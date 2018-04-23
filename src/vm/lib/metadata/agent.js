@@ -20,7 +20,7 @@
  *
  * CDDL HEADER END
  *
- * Copyright (c) 2017, Joyent, Inc. All rights reserved.
+ * Copyright (c) 2018, Joyent, Inc.
  *
  *
  * # OVERVIEW
@@ -177,6 +177,7 @@ var sdc_fields = [
     'internal_metadata_namespaces',
     'limit_priv',
     'last_modified',
+    'maintain_network',
     'maintain_resolvers',
     'max_physical_memory',
     'max_locked_memory',
