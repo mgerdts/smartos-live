@@ -47,6 +47,9 @@ export PATH
 # forcemount			7
 # unmount			8
 
+set -A cmdname ready boot forecboot reboot halt uninstalling mount forcemount \
+    unmount
+
 subcommand=$1
 ZONENAME=$2
 ZONEPATH=$3
@@ -883,30 +886,30 @@ function fix_forced_attrs {
 
 case $subcommand in
 pre)
-	case $cmd in
-	0)	# pre-ready
+	case ${cmdname[$cmd]} in
+	ready)
 		fix_forced_attrs
 		setup_fs
 		;;
-	4)	# pre-halt
+	halt)
 		[[ -n "$jst_snowsnap" ]] && cleanup_snapshots
 		cleanup_net
 		;;
 	esac
 	;;
 post)
-	case $cmd in
-	0)	# post-ready
+	case ${cmdname[$cmd]} in
+	ready)
 		[[ -n "$jst_showsnap" ]] && setup_snapshots
 		setup_net
 		setup_fw
 		;;
-	1)	# post-boot
+	boot)
 		# We can't set a rctl until we have a process in the zone to
 		# grab
 		setup_cpu_baseline
 		;;
-	8)	# post-unmount
+	unmount)
 		# Zone halt is hung unmounting, try to recover
 		if [[ $state == 6 ]]; then
 			cleanup_mount "$6"
@@ -915,5 +918,15 @@ post)
 	esac
 	;;
 esac
+
+# Brands may define their own <brand>_<pre|post>_<ready|boot|...> functions.
+# If such a function exists for this state change, execute it.
+# The return value of the brand hook is not propagated as the exit value because
+# vmadm create does not handle non-zero exits from zoneadm gracefully during
+# provisioning.  This should be fixed.
+brandhook=${ps_brand}_${subcommand}_${cmdname[$cmd]}
+if type -f "$brandhook" >/dev/null 2>&1; then
+	$brandhook
+fi
 
 exit 0
