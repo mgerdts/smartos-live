@@ -38,7 +38,6 @@ var VM = require('/usr/vm/node_modules/VM');
 var onlyif = require('/usr/node/node_modules/onlyif');
 var path = require('path');
 var http = require('http');
-var Queue = require('/usr/vm/node_modules/queue').Queue;
 var Qmp = require('/usr/vm/node_modules/qmp').Qmp;
 var qs = require('querystring');
 var url = require('url');
@@ -86,8 +85,6 @@ var seen_vms = {};
 // Used for reporting state changes (running/stopped) to interested listeners
 var stateReporter = new EventEmitter();
 
-// Zone Event serialization queue
-var zoneEventQueue;
 
 function sysinfo(callback)
 {
@@ -886,27 +883,19 @@ function stateWaiter(vmUuid, state, opts, callback) {
     }, 30000);
 }
 
-function updateZoneStatus(opts, callback)
+// NOTE: nobody's paying attention to whether this completes or not.
+function updateZoneStatus(ev)
 {
+    var load_fields;
     var reprovisioning = false;
-
-    assert.object(opts, 'opts');
-    assert.object(opts.ev, 'opts.ev');
-    assert.object(opts.vmobj, 'opts.vmobj');
-    assert.func(callback, 'callback');
-
-    var ev = opts.ev;
-    var vmobj = opts.vmobj;
-
-    log.trace({ev: ev}, 'updateZoneStatus called');
 
     if (! ev.hasOwnProperty('zonename') || ! ev.hasOwnProperty('oldstate')
         || ! ev.hasOwnProperty('newstate') || ! ev.hasOwnProperty('date')) {
 
-        log.debug({ev: ev}, 'skipping unknown event');
-        callback();
+        log.debug('skipping unknown event: ' + JSON.stringify(ev, null, 2));
         return;
     }
+
 
     /*
      * With OS-4942 and OS-5011 additional states were added which occur before
@@ -920,14 +909,6 @@ function updateZoneStatus(opts, callback)
         // just log it
         log.debug({old: ev.oldstate, new: ev.newstate},
             'ignoring state transitions before first boot');
-        callback();
-        return;
-    }
-
-    // never do anything to failed zones
-    if (vmobj.failed) {
-        log.info('doing nothing for failed VM %s', ev.zonename);
-        callback();
         return;
     }
 
@@ -940,12 +921,6 @@ function updateZoneStatus(opts, callback)
         stateReporter.emit('stopped', ev.zonename);
     }
 
-    log.debug('VM %s went from %s to %s',
-        ev.zonename, ev.oldstate, ev.newstate);
-
-    if (!seen_vms.hasOwnProperty(ev.zonename)) {
-        seen_vms[ev.zonename] = vmobj;
-    }
     /*
      * State changes we care about:
      *
@@ -967,89 +942,151 @@ function updateZoneStatus(opts, callback)
      *    - if <zonepath>/root/var/svc/provisioning shows up check for
      *      reprovisioning
      */
-    if (PROV_WAIT[vmobj.uuid]) {
-        /*
-         * We're already waiting for this machine to provision, other
-         * transitions are ignored in this state because we don't start VNC
-         * until after provisioning anyway.
-         */
-        log.debug('still waiting for %s to complete provisioning, '
-            + 'ignoring additional transition', vmobj.uuid);
-        callback();
-    } else if (!vmobj.provisioned) {
-        log.debug('VM %s is not provisioned and not provisioning', vmobj.uuid);
-        next();
-    } else if (vmobj.hvm
+
+    // if we've never seen this VM before, we always load once.
+    if (!seen_vms.hasOwnProperty(ev.zonename)) {
+        log.debug(ev.zonename + ' is a VM we haven\'t seen before and went '
+            + 'from ' + ev.oldstate + ' to ' + ev.newstate + ' at ' + ev.date);
+        seen_vms[ev.zonename] = {};
+        // We'll continue on to load this VM below with VM.load()
+    } else if (!seen_vms[ev.zonename].hasOwnProperty('uuid')) {
+        // We just saw this machine and haven't finished loading it the first
+        // time.
+        log.debug('Already loading VM ' + ev.zonename + ' ignoring transition'
+            + ' from ' + ev.oldstate + ' to ' + ev.newstate + ' at ' + ev.date);
+        return;
+    } else if (PROV_WAIT[seen_vms[ev.zonename].uuid]) {
+        // We're already waiting for this machine to provision, other
+        // transitions are ignored in this state because we don't start VNC
+        // until after provisioning anyway.
+        log.debug('still waiting for ' + seen_vms[ev.zonename].uuid
+            + ' to complete provisioning, ignoring additional transition.');
+        return;
+    } else if (!(seen_vms[ev.zonename].provisioned)) {
+        log.debug('VM ' + seen_vms[ev.zonename].uuid + ' is not provisioned'
+            + ' and not provisioning, doing VM.load().');
+        // Continue on to VM.load()
+    } else if (seen_vms[ev.zonename].brand === 'kvm'
         && (ev.newstate === 'running'
         || ev.oldstate === 'running'
         || ev.newstate === 'uninitialized')) {
 
-        log.info('HVM %s (%s) went from %s to %s',
-            ev.zonename, vmobj.brand, ev.oldstate, ev.newstate);
-        next();
-    } else if (vmobj.docker
-        && ev.newstate === 'uninitialized') {
+        log.info('' + ev.zonename + ' (' +seen_vms[ev.zonename].brand
+            + ') went from ' + ev.oldstate + ' to ' + ev.newstate
+            + ' at ' + ev.when);
+        // Continue on to VM.load()
+    } else if (seen_vms[ev.zonename].docker
+        && (ev.newstate === 'uninitialized')) {
 
-        log.info('VM %s (docker) went from %s to %s',
-            ev.zonename, ev.oldstate, ev.newstate);
+        VM.load(ev.zonename, {fields: [
+            'autoboot',
+            'brand',
+            'exit_status',
+            'internal_metadata',
+            'state',
+            'uuid',
+            'zone_state',
+            'zonepath'
+        ]}, function (err, vmobj) {
+            log.info(ev.zonename + ' (docker) went from ' + ev.oldstate + ' to '
+                + ev.newstate + ' at ' + ev.date);
 
-        /*
-         * If we stop while autoboot is set, the user was intending for it
-         * to be up. So, if there's a restart policy we start it. If not, we
-         * leave it alone.
-         */
-        if (vmobj.autoboot
-            && vmobj.zone_state !== 'running'
-            && vmobj.internal_metadata
-            && vmobj.internal_metadata['docker:restartpolicy']) {
+            /*
+             * If we stop while autoboot is set, the user was intending for it
+             * to be up. So, if there's a restart policy we start it. If not, we
+             * leave it alone.
+             */
+            if (vmobj.autoboot
+                && vmobj.zone_state !== 'running'
+                && vmobj.internal_metadata
+                && vmobj.internal_metadata['docker:restartpolicy']) {
 
-            // Add the last_runtime field in case we should reset the delay
-            addLastRuntime(vmobj, {log: log}, function () {
-                // no callback to call when updateZoneStatus() completes,
-                // nobody cares about errors.
-                applyDockerRestartPolicy(vmobj);
-            });
-        }
-        callback();
-    } else {
-        assert.string(vmobj.zonepath, 'vmobj.zonepath');
-
-        fs.stat(util.format('%s/root/var/svc/provisioning', vmobj.zonepath),
-            function (err, stats) {
-
-            if (err && err.code === 'ENOENT') {
-                // File not found - not reproviosining
-                log.debug('provisioning file not found');
-            } else if (err) {
-                log.warn(err, 'Unable to check for /var/svc/provisioning for '
-                    + 'VM %s', vmobj.uuid);
-            } else {
-                assert(stats, 'stats');
-
-                log.info('/var/svc/provisioning exists for VM %s, '
-                    + 'assuming reprovisioning', vmobj.uuid);
-                reprovisioning = true;
-            }
-
-            if (reprovisioning) {
-                next();
-            } else {
-                log.trace('ignoring transition for %s (%s)',
-                    ev.zonename, vmobj.brand);
-                callback();
+                // Add the last_runtime field in case we should reset the delay
+                addLastRuntime(vmobj, {log: log}, function () {
+                    // no callback to call when updateZoneStatus() completes,
+                    // nobody cares about errors.
+                    applyDockerRestartPolicy(vmobj);
+                });
             }
         });
+
+        return;
+    } else {
+        try {
+            if (fs.existsSync(seen_vms[ev.zonename].zonepath
+                + '/root/var/svc/provisioning')) {
+
+                log.info('/var/svc/provisioning exists for VM '
+                    + seen_vms[ev.zonename].uuid + ' assuming reprovisioning');
+                reprovisioning = true;
+            }
+        } catch (e) {
+            if (e.code !== 'ENOENT') {
+                log.warn(e, 'Unable to check for /var/svc/provisioning for '
+                    + 'VM ' + seen_vms[ev.zonename].uuid);
+            }
+        }
+        if (!reprovisioning) {
+            log.trace('ignoring transition for ' + ev.zonename + ' ('
+                + seen_vms[ev.zonename].brand + ') from ' + ev.oldstate + ' to '
+                + ev.newstate + ' at ' + ev.date);
+            return;
+        }
     }
 
-    function next() {
-        if (ev.newstate === 'running') {
-            /*
-             * if we just saw it go running and we have an existing timer
-             * waiting to start it, kill that.
-             */
-            if (restart_waiters[vmobj.uuid]) {
-                clearTimeout(restart_waiters[vmobj.uuid]);
-                delete restart_waiters[vmobj.uuid];
+    load_fields = [
+        'brand',
+        'docker',
+        'exit_status',
+        'failed',
+        'spice_opts',
+        'spice_password',
+        'spice_port',
+        'state',
+        'transition_expire',
+        'transition_to',
+        'uuid',
+        'vnc_password',
+        'vnc_port',
+        'zone_state',
+        'zonename',
+        'zonepath'
+    ];
+
+    // XXX won't work if ev.zonename != uuid, use lookup instead?
+    VM.load(ev.zonename, {fields: load_fields}, function (err, vmobj) {
+
+        if (err) {
+            log.warn(err, 'unable to load zone: ' + err.message);
+            return;
+        }
+
+        if (vmobj.failed) {
+            // never do anything to failed zones
+            log.info('doing nothing for ' + ev.zonename + ' transition because '
+                + ' VM is marked "failed".');
+            return;
+        }
+
+        // keep track of a few things about this zone that won't change so that
+        // we don't have to VM.load() every time.
+        if (!seen_vms.hasOwnProperty(ev.zonename)) {
+            seen_vms[ev.zonename] = {};
+        }
+        if (!seen_vms[ev.zonename].hasOwnProperty('uuid')) {
+            seen_vms[ev.zonename].uuid = vmobj.uuid;
+            seen_vms[ev.zonename].brand = vmobj.brand;
+            if (vmobj.docker) {
+                seen_vms[ev.zonename].docker = vmobj.docker;
+            }
+            seen_vms[ev.zonename].zonepath = vmobj.zonepath;
+            if (ev.newstate === 'running') {
+                // if we just saw it go running and we have an existing timer
+                // waiting to start it, kill that.
+                if (restart_waiters[vmobj.uuid]) {
+                    clearTimeout(restart_waiters[vmobj.uuid]);
+                    delete restart_waiters[vmobj.uuid];
+                }
             }
         }
 
@@ -1058,7 +1095,6 @@ function updateZoneStatus(opts, callback)
             if (PROV_WAIT.hasOwnProperty(vmobj.uuid)) {
                 log.trace('already waiting for ' + vmobj.uuid
                     + ' to leave "provisioning"');
-                callback();
                 return;
             }
 
@@ -1078,24 +1114,22 @@ function updateZoneStatus(opts, callback)
                 if (prov_err) {
                     log.error(prov_err, 'error handling provisioning state for'
                         + ' ' + vmobj.uuid + ': ' + prov_err.message);
-                } else {
-                    log.debug('handleProvision() for %s returned: %s',
-                        vmobj.uuid, result);
+                    return;
                 }
-
-                callback();
+                log.debug('handleProvision() for ' + vmobj.uuid + ' returned: '
+                    +  result);
+                return;
             });
-            return;
         } else {
             // This zone finished provisioning some time in the past
             seen_vms[ev.zonename].provisioned = true;
         }
 
-        // don't handle transitions other than provisioning for non-hvm
-        if (!vmobj.hvm) {
-            log.trace('doing nothing for %s because brand %s non-hvm',
-                ev.zonename, vmobj.brand);
-            callback();
+        // don't handle transitions other than provisioning for non-kvm/bhyve
+        if (['bhyve', 'kvm'].indexOf(vmobj.brand) === -1) {
+            log.trace('doing nothing for ' + ev.zonename + ' transition '
+                + 'because brand "' + vmobj.brand
+                + '" is not "kvm" or "bhyve"');
             return;
         }
 
@@ -1107,58 +1141,31 @@ function updateZoneStatus(opts, callback)
                 rotateKVMLog(vmobj.uuid);
             }
             spawnRemoteDisplay(vmobj);
-            callback();
-            return;
-        }
-
-        if (ev.oldstate === 'running') {
+        } else if (ev.oldstate === 'running') {
             if (VNC.hasOwnProperty(ev.zonename)) {
                 // VMs always have zonename === uuid, so we can remove this
                 log.info('clearing state for disappearing VM ' + ev.zonename);
                 clearVM(ev.zonename);
             }
-            callback();
-            return;
-        }
-
-        if (ev.newstate === 'uninitialized') { // this means installed!?
+        } else if (ev.newstate === 'uninitialized') { // this means installed!?
             // XXX we're running stop so it will clear the transition marker
             VM.stop(ev.zonename, {'force': true}, function (e) {
                 if (e && e.code !== 'ENOTRUNNING') {
                     log.error(e, 'stop failed');
                 }
-                callback();
             });
-            return;
         }
-
-        callback();
-    }
+    });
 }
 
-function startZoneEvent(func)
+function startZoneEvent(callback)
 {
-    assert.func(func, 'func');
-
     var ze = new ZoneEvent({
         name: 'vmadmd ZoneEvent',
         log: log
     });
-
-    ze.on('event', function (ev, vm) {
-        var description = util.format('vmadmd ZoneEvent event: %s %s -> %s',
-            ev.zonename, ev.oldstate, ev.newstate);
-
-        zoneEventQueue.enqueue({
-            description: description,
-            func: function (extras, cb) {
-                var opts = {
-                    ev: ev,
-                    vmobj: vm
-                };
-                func(opts, cb);
-            }
-        });
+    ze.on('event', function (ev) {
+        callback(ev);
     });
 }
 
@@ -2632,11 +2639,6 @@ onlyif.rootInSmartosGlobal(function (err) {
         name: VM.logname,
         streams: [log_stream],
         serializers: bunyan.stdSerializers
-    });
-
-    zoneEventQueue = new Queue({
-        log: log,
-        workers: 1
     });
 
     if (err) {
