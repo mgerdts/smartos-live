@@ -134,6 +134,7 @@ JS_CHECK_TARGETS=\
 	vm/tests/test-vminfod-zonewatcher.js \
 	vm/tests/test-vminfod-zonewatcher-overflow.js \
 	vm/tests/test-vminfod-zpoolwatcher.js \
+	vm/tests/test-vnc.js \
 	vm/lib/metadata/*.js
 
 JS_CHECK_OLDSKOOL_TARGETS = \
