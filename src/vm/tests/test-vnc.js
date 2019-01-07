@@ -40,42 +40,33 @@ require('nodeunit-plus');
 
 VM.loglevel = 'DEBUG';
 
-var ADMIN_IP;
+var ADMIN_IP = null;
 
-function getAdminIp()
+function getAdminIp(cb)
 {
-    var ip;
+    assert.func(cb, 'cb');
 
-    vasync.waterfall([
-        function getSysInfo(next) {
-            execFile('/usr/bin/sysinfo', [], function (error, stdout, stderr) {
-                if (error) {
-                    next(new Error(stderr.toString()));
+    execFile('/usr/bin/sysinfo', [], function (error, stdout, stderr) {
+        var nic, nics, si;
+
+        if (error) {
+            throw new Error(stderr.toString());
+        }
+
+        // nic tags are in sysinfo but not readily available, we need
+        // admin_ip to know where to listen for stuff like VNC.
+        si = JSON.parse(stdout.toString());
+        nics = si['Network Interfaces'];
+        for (nic in nics) {
+            if (nics.hasOwnProperty(nic)) {
+                if (nics[nic]['NIC Names'].indexOf('admin') !== -1) {
+                    cb(nics[nic].ip4addr);
                     return;
                 }
-                next(null, JSON.parse(stdout.toString()));
-            });
-        }, function findAdminIp(next, si) {
-            var nic, nics;
-
-            // nic tags are in sysinfo but not readily available, we need
-            // admin_ip to know where to listen for stuff like VNC.
-            nics = si['Network Interfaces'];
-            for (nic in nics) {
-                if (nics.hasOwnProperty(nic)) {
-                    if (nics[nic]['NIC Names'].indexOf('admin') !== -1) {
-                        ip = nics[nic].ip4addr;
-                        next(null);
-                    }
-                }
             }
-            next(new Error('Could not find NIC on admin network'));
-        }], function done(err) {
-            if (err) {
-                throw (err);
-            }
-        });
-    return ip;
+        }
+        throw new Error('Could not find admin network');
+    });
 }
 
 /*
@@ -91,12 +82,24 @@ function getAdminIp()
  */
 var vmobj;
 
-before(function (cb) {
+before(function _before(cb) {
+    assert.func(cb, 'cb');
     vmobj = undefined;
-    cb();
+    if (ADMIN_IP === null) {
+        console.log('getting ip');
+        assert.func(cb, 'cb');
+        getAdminIp(function _gotIp(ip) {
+            ADMIN_IP = ip;
+            console.log('got ip ' + ADMIN_IP);
+            cb()
+        });
+    } else {
+        cb();
+    }
 });
 
-after(function (cb) {
+after(function _after(cb) {
+    assert.func(cb, 'cb');
     if (!vmobj) {
         cb();
         return;
@@ -111,8 +114,10 @@ after(function (cb) {
     });
 });
 
-function createVM(t, payload, next)
+function createVM(options, payload, next)
 {
+    assert.obj(options);
+
     VM.create(payload, function _create_cb(err, obj) {
         if (err) {
             t.ok(false, 'error creating VM: ' + err);
@@ -149,14 +154,30 @@ function checkRunning(t, next)
 
 function checkVncRandomPort(t, next)
 {
-    if (!vmobj.hasOwnProperty('vnc_port')) {
-        t.ok(false, 'VM does not have vnc_port set');
-        next(new Error('VM does not have vnc_port set'));
+    if (vmobj.hasOwnProperty('vnc_port')) {
+        var err = new Error('VM has vnc_port statically set');
+        t.ok(false, err.message);
+        next(err);
         return;
     }
-    // Random ports are big and others are small, amiright?
-    t.ok(vmobj.vnc_port > 10000 && vmobj.vnc_port < 65536,
-        'vnc_port ' + vmobj.vnc_port + ' looks random');
+
+    VM.info(vmobj.uuid, 'vnc', {}, function _getVncPort(err, info) {
+        if (err) {
+            t.ok(false, 'VM.info failed: ' + err.message);
+            next(err);
+            return;
+        }
+        if (info.hasOwnProperty('vnc') && info.vnc.hasOwnProperty('port')) {
+            t.ok(true, 'found dynamic vnc port: ' + info.vnc.port);
+        } else {
+            t.ok(false,
+                'no vnc.port returned by VM.info(): ' + JSON.stringify(info));
+        }
+
+        t.ok(info.hasOwnProperty('vnc'), 'vnc object found in results');
+        t.ok(info.vnc.hasOwnProperty('port'), 'vnc object found in results');
+    });
+
     next(null, t);
 }
 
@@ -231,8 +252,6 @@ var base_payload = {
  * and after each test.
  */
 
-ADMIN_IP = getAdminIp();
-
 testHVM('provision with autoboot has working vnc at random port',
     function vncTest1(t, brand) {
         var payload = jsprim.deepCopy(base_payload);
@@ -255,6 +274,7 @@ testHVM('provision with autoboot has working vnc at random port',
             }
         );
     });
+/*
 testHVM('provision then boot has working vnc at random port',
     function vncTest2(t, brand) {
         t.ok(false, 'not implmented');
@@ -300,3 +320,4 @@ testHVM('vmadm update vnc_port affects live instance',
         t.ok(false, 'not implmented');
         t.end();
     });
+*/
